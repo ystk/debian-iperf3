@@ -1,3 +1,9 @@
+iperf3 (3.0.7-1+deb8u1) jessie-security; urgency=high
+
+  * Integrate patch for CVE-2016-4303 (Closes: #827116)
+
+ -- Roberto Lumbreras <rover@debian.org>  Sun, 26 Jan 2020 18:29:03 +0100
+
 iperf3 (3.0.7-1) unstable; urgency=medium
 
   * new upstream version
