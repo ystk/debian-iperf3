@@ -1,3 +1,13 @@
+iperf3 (3.0.7-1+deb8u2) jessie-security; urgency=high
+
+  * Non-maintainer upload by the ELTS team.
+  * Fix CVE-2023-38403:
+    A memory allocation issue was found in iperf3, the Internet Protocol
+    bandwidth measuring tool, that may cause a denial of service when
+    encountering a certain invalid length value in TCP packets.
+
+ -- Markus Koschany <apo@debian.org>  Thu, 27 Jul 2023 16:24:41 +0200
+
 iperf3 (3.0.7-1+deb8u1) jessie-security; urgency=high
 
   * Integrate patch for CVE-2016-4303 (Closes: #827116)
