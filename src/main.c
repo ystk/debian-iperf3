@@ -1,11 +1,30 @@
 /*
- * Copyright (c) 2009-2014, The Regents of the University of California,
- * through Lawrence Berkeley National Laboratory (subject to receipt of any
- * required approvals from the U.S. Dept. of Energy).  All rights reserved.
+ * iperf, Copyright (c) 2014, 2015, 2017, 2019, The Regents of the University of
+ * California, through Lawrence Berkeley National Laboratory (subject
+ * to receipt of any required approvals from the U.S. Dept. of
+ * Energy).  All rights reserved.
  *
- * This code is distributed under a BSD style license, see the LICENSE file
- * for complete information.
+ * If you have questions about your rights to use or distribute this
+ * software, please contact Berkeley Lab's Technology Transfer
+ * Department at TTD@lbl.gov.
+ *
+ * NOTICE.  This software is owned by the U.S. Department of Energy.
+ * As such, the U.S. Government has been granted for itself and others
+ * acting on its behalf a paid-up, nonexclusive, irrevocable,
+ * worldwide license in the Software to reproduce, prepare derivative
+ * works, and perform publicly and display publicly.  Beginning five
+ * (5) years after the date permission to assert copyright is obtained
+ * from the U.S. Department of Energy, and subject to any subsequent
+ * five (5) year renewals, the U.S. Government is granted for itself
+ * and others acting on its behalf a paid-up, nonexclusive,
+ * irrevocable, worldwide license in the Software to reproduce,
+ * prepare derivative works, distribute copies to the public, perform
+ * publicly and display publicly, and to permit others to do so.
+ *
+ * This code is distributed under a BSD style license, see the LICENSE
+ * file for complete information.
  */
+#include "iperf_config.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -14,20 +33,21 @@
 #include <errno.h>
 #include <signal.h>
 #include <unistd.h>
+#ifdef HAVE_STDINT_H
 #include <stdint.h>
+#endif
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <netdb.h>
-#include <stdint.h>
-#include <netinet/tcp.h>
 
 #include "iperf.h"
 #include "iperf_api.h"
-#include "units.h"
-#include "locale.h"
+#include "iperf_util.h"
+#include "iperf_locale.h"
 #include "net.h"
+#include "units.h"
 
 
 static int run(struct iperf_test *test);
@@ -81,7 +101,7 @@ main(int argc, char **argv)
     if (iperf_parse_arguments(test, argc, argv) < 0) {
         iperf_err(test, "parameter error - %s", iperf_strerror(i_errno));
         fprintf(stderr, "\n");
-        usage_long();
+        usage_long(stdout);
         exit(1);
     }
 
@@ -93,44 +113,72 @@ main(int argc, char **argv)
     return 0;
 }
 
+
+static jmp_buf sigend_jmp_buf;
+
+static void __attribute__ ((noreturn))
+sigend_handler(int sig)
+{
+    longjmp(sigend_jmp_buf, 1);
+}
+
 /**************************************************************************/
 static int
 run(struct iperf_test *test)
 {
-    int consecutive_errors;
+    /* Termination signals. */
+    iperf_catch_sigend(sigend_handler);
+    if (setjmp(sigend_jmp_buf))
+	iperf_got_sigend(test);
+
+    /* Ignore SIGPIPE to simplify error handling */
+    signal(SIGPIPE, SIG_IGN);
 
     switch (test->role) {
         case 's':
 	    if (test->daemon) {
-		int rc = daemon(0, 0);
+		int rc;
+		rc = daemon(0, 0);
 		if (rc < 0) {
 		    i_errno = IEDAEMON;
 		    iperf_errexit(test, "error - %s", iperf_strerror(i_errno));
 		}
 	    }
-	    consecutive_errors = 0;
+	    if (iperf_create_pidfile(test) < 0) {
+		i_errno = IEPIDFILE;
+		iperf_errexit(test, "error - %s", iperf_strerror(i_errno));
+	    }
             for (;;) {
-                if (iperf_run_server(test) < 0) {
+		int rc;
+		rc = iperf_run_server(test);
+		if (rc < 0) {
 		    iperf_err(test, "error - %s", iperf_strerror(i_errno));
-                    fprintf(stderr, "\n");
-		    ++consecutive_errors;
-		    if (consecutive_errors >= 5) {
-		        fprintf(stderr, "too many errors, exiting\n");
-			break;
+		    if (rc < -1) {
+		        iperf_errexit(test, "exiting");
 		    }
-                } else
-		    consecutive_errors = 0;
+                }
                 iperf_reset_test(test);
+                if (iperf_get_test_one_off(test)) {
+		    /* Authentication failure doesn't count for 1-off test */
+		    if (rc < 0 && i_errno == IEAUTHTEST) {
+			continue;
+		    }
+		    break;
+		}
             }
+	    iperf_delete_pidfile(test);
             break;
-        case 'c':
-            if (iperf_run_client(test) < 0)
+	case 'c':
+	    if (iperf_run_client(test) < 0)
 		iperf_errexit(test, "error - %s", iperf_strerror(i_errno));
             break;
         default:
             usage();
             break;
     }
+
+    iperf_catch_sigend(SIG_DFL);
+    signal(SIGPIPE, SIG_DFL);
 
     return 0;
 }
