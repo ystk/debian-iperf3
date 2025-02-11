@@ -1,25 +1,46 @@
 /*
- * Copyright (c) 2009-2011, The Regents of the University of California,
- * through Lawrence Berkeley National Laboratory (subject to receipt of any
- * required approvals from the U.S. Dept. of Energy).  All rights reserved.
+ * iperf, Copyright (c) 2014-2019, The Regents of the University of
+ * California, through Lawrence Berkeley National Laboratory (subject
+ * to receipt of any required approvals from the U.S. Dept. of
+ * Energy).  All rights reserved.
  *
- * This code is distributed under a BSD style license, see the LICENSE file
- * for complete information.
+ * If you have questions about your rights to use or distribute this
+ * software, please contact Berkeley Lab's Technology Transfer
+ * Department at TTD@lbl.gov.
+ *
+ * NOTICE.  This software is owned by the U.S. Department of Energy.
+ * As such, the U.S. Government has been granted for itself and others
+ * acting on its behalf a paid-up, nonexclusive, irrevocable,
+ * worldwide license in the Software to reproduce, prepare derivative
+ * works, and perform publicly and display publicly.  Beginning five
+ * (5) years after the date permission to assert copyright is obtained
+ * from the U.S. Department of Energy, and subject to any subsequent
+ * five (5) year renewals, the U.S. Government is granted for itself
+ * and others acting on its behalf a paid-up, nonexclusive,
+ * irrevocable, worldwide license in the Software to reproduce,
+ * prepare derivative works, distribute copies to the public, perform
+ * publicly and display publicly, and to permit others to do so.
+ *
+ * This code is distributed under a BSD style license, see the LICENSE
+ * file for complete information.
  */
+#include "iperf_config.h"
 
 #include <stdio.h>
 #include <unistd.h>
 #include <errno.h>
+#include <arpa/inet.h>
 #include <sys/socket.h>
 #include <sys/types.h>
-#include <sys/errno.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <assert.h>
 #include <netdb.h>
 #include <string.h>
-#include <sys/fcntl.h>
+#include <fcntl.h>
+#include <limits.h>
 
+#ifdef HAVE_SENDFILE
 #ifdef linux
 #include <sys/sendfile.h>
 #else
@@ -34,10 +55,65 @@
 #endif
 #endif
 #endif
+#endif /* HAVE_SENDFILE */
+
+#ifdef HAVE_POLL_H
+#include <poll.h>
+#endif /* HAVE_POLL_H */
 
 #include "iperf_util.h"
 #include "net.h"
 #include "timer.h"
+
+/*
+ * Declaration of gerror in iperf_error.c.  Most other files in iperf3 can get this
+ * by including "iperf.h", but net.c lives "below" this layer.  Clearly the
+ * presence of this declaration is a sign we need to revisit this layering.
+ */
+extern int gerror;
+
+/*
+ * timeout_connect adapted from netcat, via OpenBSD and FreeBSD
+ * Copyright (c) 2001 Eric Jackson <ericj@monkey.org>
+ */
+int
+timeout_connect(int s, const struct sockaddr *name, socklen_t namelen,
+    int timeout)
+{
+	struct pollfd pfd;
+	socklen_t optlen;
+	int flags, optval;
+	int ret;
+
+	flags = 0;
+	if (timeout != -1) {
+		flags = fcntl(s, F_GETFL, 0);
+		if (fcntl(s, F_SETFL, flags | O_NONBLOCK) == -1)
+			return -1;
+	}
+
+	if ((ret = connect(s, name, namelen)) != 0 && errno == EINPROGRESS) {
+		pfd.fd = s;
+		pfd.events = POLLOUT;
+		if ((ret = poll(&pfd, 1, timeout)) == 1) {
+			optlen = sizeof(optval);
+			if ((ret = getsockopt(s, SOL_SOCKET, SO_ERROR,
+			    &optval, &optlen)) == 0) {
+				errno = optval;
+				ret = optval == 0 ? 0 : -1;
+			}
+		} else if (ret == 0) {
+			errno = ETIMEDOUT;
+			ret = -1;
+		} else
+			ret = -1;
+	}
+
+	if (timeout != -1 && fcntl(s, F_SETFL, flags) == -1)
+		ret = -1;
+
+	return (ret);
+}
 
 /* netdial and netannouce code comes from libtask: http://swtch.com/libtask/
  * Copyright: http://swtch.com/libtask/COPYRIGHT
@@ -45,23 +121,23 @@
 
 /* make connection to server */
 int
-netdial(int domain, int proto, char *local, char *server, int port)
+netdial(int domain, int proto, const char *local, int local_port, const char *server, int port, int timeout)
 {
     struct addrinfo hints, *local_res, *server_res;
-    int s;
+    int s, saved_errno;
 
     if (local) {
         memset(&hints, 0, sizeof(hints));
         hints.ai_family = domain;
         hints.ai_socktype = proto;
-        if (getaddrinfo(local, NULL, &hints, &local_res) != 0)
+        if ((gerror = getaddrinfo(local, NULL, &hints, &local_res)) != 0)
             return -1;
     }
 
     memset(&hints, 0, sizeof(hints));
     hints.ai_family = domain;
     hints.ai_socktype = proto;
-    if (getaddrinfo(server, NULL, &hints, &server_res) != 0)
+    if ((gerror = getaddrinfo(server, NULL, &hints, &server_res)) != 0)
         return -1;
 
     s = socket(server_res->ai_family, proto, 0);
@@ -72,20 +148,66 @@ netdial(int domain, int proto, char *local, char *server, int port)
         return -1;
     }
 
+    /* Bind the local address if given a name (with or without --cport) */
     if (local) {
+        if (local_port) {
+            struct sockaddr_in *lcladdr;
+            lcladdr = (struct sockaddr_in *)local_res->ai_addr;
+            lcladdr->sin_port = htons(local_port);
+        }
+
         if (bind(s, (struct sockaddr *) local_res->ai_addr, local_res->ai_addrlen) < 0) {
+	    saved_errno = errno;
 	    close(s);
 	    freeaddrinfo(local_res);
 	    freeaddrinfo(server_res);
+	    errno = saved_errno;
             return -1;
 	}
         freeaddrinfo(local_res);
     }
+    /* No local name, but --cport given */
+    else if (local_port) {
+	size_t addrlen;
+	struct sockaddr_storage lcl;
+
+	/* IPv4 */
+	if (server_res->ai_family == AF_INET) {
+	    struct sockaddr_in *lcladdr = (struct sockaddr_in *) &lcl;
+	    lcladdr->sin_family = AF_INET;
+	    lcladdr->sin_port = htons(local_port);
+	    lcladdr->sin_addr.s_addr = INADDR_ANY;
+	    addrlen = sizeof(struct sockaddr_in);
+	}
+	/* IPv6 */
+	else if (server_res->ai_family == AF_INET6) {
+	    struct sockaddr_in6 *lcladdr = (struct sockaddr_in6 *) &lcl;
+	    lcladdr->sin6_family = AF_INET6;
+	    lcladdr->sin6_port = htons(local_port);
+	    lcladdr->sin6_addr = in6addr_any;
+	    addrlen = sizeof(struct sockaddr_in6);
+	}
+	/* Unknown protocol */
+	else {
+	    errno = EAFNOSUPPORT;
+            return -1;
+	}
+
+        if (bind(s, (struct sockaddr *) &lcl, addrlen) < 0) {
+	    saved_errno = errno;
+	    close(s);
+	    freeaddrinfo(server_res);
+	    errno = saved_errno;
+            return -1;
+        }
+    }
 
     ((struct sockaddr_in *) server_res->ai_addr)->sin_port = htons(port);
-    if (connect(s, (struct sockaddr *) server_res->ai_addr, server_res->ai_addrlen) < 0 && errno != EINPROGRESS) {
+    if (timeout_connect(s, (struct sockaddr *) server_res->ai_addr, server_res->ai_addrlen, timeout) < 0 && errno != EINPROGRESS) {
+	saved_errno = errno;
 	close(s);
 	freeaddrinfo(server_res);
+	errno = saved_errno;
         return -1;
     }
 
@@ -96,11 +218,11 @@ netdial(int domain, int proto, char *local, char *server, int port)
 /***************************************************************/
 
 int
-netannounce(int domain, int proto, char *local, int port)
+netannounce(int domain, int proto, const char *local, int port)
 {
     struct addrinfo hints, *res;
     char portstr[6];
-    int s, opt;
+    int s, opt, saved_errno;
 
     snprintf(portstr, 6, "%d", port);
     memset(&hints, 0, sizeof(hints));
@@ -124,7 +246,7 @@ netannounce(int domain, int proto, char *local, int port)
     }
     hints.ai_socktype = proto;
     hints.ai_flags = AI_PASSIVE;
-    if (getaddrinfo(local, portstr, &hints, &res) != 0)
+    if ((gerror = getaddrinfo(local, portstr, &hints, &res)) != 0)
         return -1; 
 
     s = socket(res->ai_family, proto, 0);
@@ -136,8 +258,10 @@ netannounce(int domain, int proto, char *local, int port)
     opt = 1;
     if (setsockopt(s, SOL_SOCKET, SO_REUSEADDR, 
 		   (char *) &opt, sizeof(opt)) < 0) {
+	saved_errno = errno;
 	close(s);
 	freeaddrinfo(res);
+	errno = saved_errno;
 	return -1;
     }
     /*
@@ -156,24 +280,30 @@ netannounce(int domain, int proto, char *local, int port)
 	    opt = 1;
 	if (setsockopt(s, IPPROTO_IPV6, IPV6_V6ONLY, 
 		       (char *) &opt, sizeof(opt)) < 0) {
+	    saved_errno = errno;
 	    close(s);
 	    freeaddrinfo(res);
+	    errno = saved_errno;
 	    return -1;
 	}
     }
 #endif /* IPV6_V6ONLY */
 
     if (bind(s, (struct sockaddr *) res->ai_addr, res->ai_addrlen) < 0) {
+        saved_errno = errno;
         close(s);
 	freeaddrinfo(res);
+        errno = saved_errno;
         return -1;
     }
 
     freeaddrinfo(res);
     
     if (proto == SOCK_STREAM) {
-        if (listen(s, 5) < 0) {
+        if (listen(s, INT_MAX) < 0) {
+	    saved_errno = errno;
 	    close(s);
+	    errno = saved_errno;
             return -1;
         }
     }
@@ -195,7 +325,7 @@ Nread(int fd, char *buf, size_t count, int prot)
     while (nleft > 0) {
         r = read(fd, buf, nleft);
         if (r < 0) {
-            if (errno == EINTR || errno == EAGAIN)
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)
                 break;
             else
                 return NET_HARDERROR;
@@ -225,6 +355,9 @@ Nwrite(int fd, const char *buf, size_t count, int prot)
 	    switch (errno) {
 		case EINTR:
 		case EAGAIN:
+#if (EAGAIN != EWOULDBLOCK)
+		case EWOULDBLOCK:
+#endif
 		return count - nleft;
 
 		case ENOBUFS:
@@ -245,19 +378,12 @@ Nwrite(int fd, const char *buf, size_t count, int prot)
 int
 has_sendfile(void)
 {
-#ifdef linux
+#if defined(HAVE_SENDFILE)
     return 1;
-#else
-#ifdef __FreeBSD__
-    return 1;
-#else
-#if defined(__APPLE__) && defined(__MACH__) && defined(MAC_OS_X_VERSION_10_6)	/* OS X */
-    return 1;
-#else
+#else /* HAVE_SENDFILE */
     return 0;
-#endif
-#endif
-#endif
+#endif /* HAVE_SENDFILE */
+
 }
 
 
@@ -269,6 +395,7 @@ int
 Nsendfile(int fromfd, int tofd, const char *buf, size_t count)
 {
     off_t offset;
+#if defined(HAVE_SENDFILE)
 #if defined(__FreeBSD__) || (defined(__APPLE__) && defined(__MACH__) && defined(MAC_OS_X_VERSION_10_6))
     off_t sent;
 #endif
@@ -280,28 +407,29 @@ Nsendfile(int fromfd, int tofd, const char *buf, size_t count)
 	offset = count - nleft;
 #ifdef linux
 	r = sendfile(tofd, fromfd, &offset, nleft);
-#else
-#ifdef __FreeBSD__
+	if (r > 0)
+	    nleft -= r;
+#elif defined(__FreeBSD__)
 	r = sendfile(fromfd, tofd, offset, nleft, NULL, &sent, 0);
-	if (r == 0)
-	    r = sent;
-#else
-#if defined(__APPLE__) && defined(__MACH__) && defined(MAC_OS_X_VERSION_10_6)	/* OS X */
+	nleft -= sent;
+#elif defined(__APPLE__) && defined(__MACH__) && defined(MAC_OS_X_VERSION_10_6)	/* OS X */
 	sent = nleft;
 	r = sendfile(fromfd, tofd, offset, &sent, NULL, 0);
-	if (r == 0)
-	    r = sent;
+	nleft -= sent;
 #else
 	/* Shouldn't happen. */
 	r = -1;
 	errno = ENOSYS;
 #endif
-#endif
-#endif
 	if (r < 0) {
 	    switch (errno) {
 		case EINTR:
 		case EAGAIN:
+#if (EAGAIN != EWOULDBLOCK)
+		case EWOULDBLOCK:
+#endif
+		if (count == nleft)
+		    return NET_SOFTERROR;
 		return count - nleft;
 
 		case ENOBUFS:
@@ -311,92 +439,20 @@ Nsendfile(int fromfd, int tofd, const char *buf, size_t count)
 		default:
 		return NET_HARDERROR;
 	    }
-	} else if (r == 0)
+	}
+#ifdef linux
+	else if (r == 0)
 	    return NET_SOFTERROR;
-	nleft -= r;
+#endif
     }
     return count;
+#else /* HAVE_SENDFILE */
+    errno = ENOSYS;	/* error if somehow get called without HAVE_SENDFILE */
+    return NET_HARDERROR;
+#endif /* HAVE_SENDFILE */
 }
 
 /*************************************************************************/
-
-/**
- * getsock_tcp_mss - Returns the MSS size for TCP
- *
- */
-
-int
-getsock_tcp_mss(int inSock)
-{
-    int             mss = 0;
-
-    int             rc;
-    socklen_t       len;
-
-    assert(inSock >= 0); /* print error and exit if this is not true */
-
-    /* query for mss */
-    len = sizeof(mss);
-    rc = getsockopt(inSock, IPPROTO_TCP, TCP_MAXSEG, (char *)&mss, &len);
-    if (rc == -1) {
-	perror("getsockopt TCP_MAXSEG");
-	return -1;
-    }
-
-    return mss;
-}
-
-
-
-/*************************************************************/
-
-/* sets TCP_NODELAY and TCP_MAXSEG if requested */
-// XXX: This function is not being used.
-
-int
-set_tcp_options(int sock, int no_delay, int mss)
-{
-    socklen_t len;
-    int rc;
-    int new_mss;
-
-    if (no_delay == 1) {
-        len = sizeof(no_delay);
-        rc = setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, (char *)&no_delay, len);
-        if (rc == -1) {
-            perror("setsockopt TCP_NODELAY");
-            return -1;
-        }
-    }
-#ifdef TCP_MAXSEG
-    if (mss > 0) {
-        len = sizeof(new_mss);
-        assert(sock != -1);
-
-        /* set */
-        new_mss = mss;
-        len = sizeof(new_mss);
-        rc = setsockopt(sock, IPPROTO_TCP, TCP_MAXSEG, (char *)&new_mss, len);
-        if (rc == -1) {
-            perror("setsockopt TCP_MAXSEG");
-            return -1;
-        }
-        /* verify results */
-        rc = getsockopt(sock, IPPROTO_TCP, TCP_MAXSEG, (char *)&new_mss, &len);
-        if (rc == -1) {
-            perror("getsockopt TCP_MAXSEG");
-            return -1;
-        }
-        if (new_mss != mss) {
-            perror("setsockopt value mismatch");
-            return -1;
-        }
-    }
-#endif
-    return 0;
-}
-
-/****************************************************************************/
 
 int
 setnonblocking(int fd, int nonblocking)
@@ -425,10 +481,11 @@ setnonblocking(int fd, int nonblocking)
 int
 getsockdomain(int sock)
 {
-    struct sockaddr sa;
+    struct sockaddr_storage sa;
     socklen_t len = sizeof(sa);
 
-    if (getsockname(sock, &sa, &len) < 0)
-	return -1;
-    return sa.sa_family;
+    if (getsockname(sock, (struct sockaddr *)&sa, &len) < 0) {
+        return -1;
+    }
+    return ((struct sockaddr *) &sa)->sa_family;
 }

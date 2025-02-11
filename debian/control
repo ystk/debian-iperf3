@@ -2,8 +2,8 @@ Source: iperf3
 Section: net
 Priority: optional
 Maintainer: Roberto Lumbreras <rover@debian.org>
-Build-Depends: debhelper (>= 9), autotools-dev, uuid-dev, dh-autoreconf
-Standards-Version: 3.9.5
+Build-Depends: debhelper (>= 9), libssl-dev, libsctp-dev [linux-any]
+Standards-Version: 4.5.0
 Homepage: http://software.es.net/iperf/
 
 Package: iperf3
@@ -21,6 +21,8 @@ Description: Internet Protocol bandwidth measuring tool
 Package: libiperf0
 Architecture: any
 Section: libs
+Multi-Arch: same
+Pre-Depends: ${misc:Pre-Depends}
 Depends: ${shlibs:Depends}, ${misc:Depends}
 Description: Internet Protocol bandwidth measuring tool (runtime files)
  Iperf3 is a tool for performing network throughput measurements. It can
@@ -35,6 +37,7 @@ Description: Internet Protocol bandwidth measuring tool (runtime files)
 Package: libiperf-dev
 Architecture: any
 Section: libdevel
+Multi-Arch: same
 Depends: libiperf0 (= ${binary:Version}), ${misc:Depends}
 Description: Internet Protocol bandwidth measuring tool (development files)
  Iperf3 is a tool for performing network throughput measurements. It can

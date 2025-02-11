@@ -1,3 +1,5 @@
-001-manpages
-002-CVE-2016-4303
-CVE-2023-38403.patch
+03-sctp.patch
+0001-Fix-memory-allocation-hazard-1542-.-1543.patch
+CVE-2023-7250.patch
+CVE-2024-26306.patch
+CVE-2024-53580.patch
